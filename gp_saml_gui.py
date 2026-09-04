@@ -49,6 +49,48 @@ class CommentHtmlParser(HTMLParser):
 
 
 COOKIE_FIELDS = ('prelogin-cookie', 'portal-userauthcookie')
+SAFE_SAML_FIELDS = ('saml-username', 'saml-auth-status', 'saml-slo')
+
+# This thing likes to sing like a canary.
+# Unleash the pteREDACTyl!!!
+# The bodacious from the cretacious, here to SHUT YOU UP!!
+
+# hide stuff
+def sanitize_uri(uri):
+    """Return a log-safe representation of a URI without paths, queries, or goodies 
+    that chinese hackers are looking for. Nee hao, chinese hackers!"""
+    if not uri:
+        return '<none>'
+    u = urlparse(uri)
+    if u.scheme in ('http', 'https'):
+        return '%s://%s/...' % (u.scheme, u.netloc)
+    if u.scheme == 'about':
+        return uri
+    return '%s:<pteREDACTyl>' % (u.scheme or 'unknown')
+
+
+# hide stuff
+def redact_saml_fields(fields):
+    """redact bearer creds and saml payloads before writing diagnostic output."""
+    return {
+        k: (v if k.lower() in SAFE_SAML_FIELDS else '<pteREDACTyl>')
+        for k, v in fields.items()
+    }
+
+
+# hide stuff
+def redact_headers(headers):
+    # redact headers likely to contain credentials or session material
+    redacted = {}
+    for k, v in headers.items():
+        lk = k.lower()
+        if ('cookie' in lk or 'authorization' in lk or lk.startswith('saml-')):
+            # pteREDACTyl says REEEEEAAWWLLL!!
+            # which is cretaceous for "naw bruh!"
+            redacted[k] = '<pteREDACTyl>'
+        else:
+            redacted[k] = v
+    return redacted
 
 
 class SAMLLoginView:
@@ -64,14 +106,29 @@ class SAMLLoginView:
         self.saml_result = {}
         self.verbose = args.verbose
 
-        self.ctx = WebKit2.WebContext.get_default()
+        # self.ctx = WebKit2.WebContext.get_default()
+
+        # Use an ephemeral browser profile unless i explicitly say otherwise.
+        # I like cookies and cash, but I don't want them being written to the
+        # webkit profile.
+        if args.cookies:
+            self.ctx = WebKit2.WebContext.new()
+        else:
+            self.ctx = WebKit2.WebContext.new_ephemeral()
+
+        # WebKitGTK enables sandboxing on supported Linux builds, but I want the
+        # security requirement explicit
+        if hasattr(self.ctx, 'set_sandbox_enabled'):
+            self.ctx.set_sandbox_enabled(True)
+
         if not args.verify:
             self.ctx.set_tls_errors_policy(WebKit2.TLSErrorsPolicy.IGNORE)
         self.cookies = self.ctx.get_cookie_manager()
         if args.cookies:
             self.cookies.set_accept_policy(WebKit2.CookieAcceptPolicy.ALWAYS)
             self.cookies.set_persistent_storage(args.cookies, WebKit2.CookiePersistentStorage.TEXT)
-        self.wview = WebKit2.WebView()
+        # self.wview = WebKit2.WebView()
+        self.wview = WebKit2.WebView.new_with_context(self.ctx)
 
         if args.no_proxy:
             data_manager = self.ctx.get_website_data_manager()
@@ -90,6 +147,7 @@ class SAMLLoginView:
         window.connect('delete-event', self.close)
         self.wview.connect('load-changed', self.on_load_changed)
         self.wview.connect('resource-load-started', self.log_resources)
+        self.wview.connect('decide-policy', self.on_decide_policy)
 
         if html:
             self.wview.load_html(html, uri)
@@ -100,15 +158,40 @@ class SAMLLoginView:
         self.closed = True
         Gtk.main_quit()
 
+    def on_decide_policy(self, webview, decision, decision_type):
+        # block non-https (or about)
+        try:
+            request = decision.get_request()
+            uri = request.get_uri()
+        except AttributeError:
+            return False
+
+        scheme = urlparse(uri).scheme.lower()
+        navigation = decision_type in (
+            WebKit2.PolicyDecisionType.NAVIGATION_ACTION,
+            WebKit2.PolicyDecisionType.NEW_WINDOW_ACTION,
+        )
+
+        # about:blank is used internally by WebKit/load_html during saml POST
+        # flows. Everything else navigational better be https.
+        blocked = ((navigation and scheme not in ('https', 'about')) or
+                   (decision_type == WebKit2.PolicyDecisionType.RESPONSE and scheme == 'http'))
+        if blocked:
+            print('[SECURITY] Blocked sus browser request to %s' % sanitize_uri(uri), file=stderr)
+            decision.ignore()
+            return True
+
+        return False
+
     def log_resources(self, webview, resource, request):
         if self.verbose > 1:
-            print('[REQUEST] %s for resource %s' % (request.get_http_method() or 'Request', resource.get_uri()), file=stderr)
+            print('[REQUEST] %s for resource %s' % (request.get_http_method() or 'Request', sanitize_uri(resource.get_uri())), file=stderr)
         if self.verbose > 2:
             resource.connect('finished', self.log_resource_details, request)
 
     def log_resource_details(self, resource, request):
         m = request.get_http_method() or 'Request'
-        uri = resource.get_uri()
+        uri = sanitize_uri(resource.get_uri())
         rs = resource.get_response()
         h = rs.get_http_headers() if rs else None
         if h:
@@ -119,15 +202,15 @@ class SAMLLoginView:
         print('[RECEIVE] %sresource %s %s' % (content_details if h else '', m, uri), file=stderr)
 
     def log_resource_text(self, resource, result, content_type, charset=None, show_headers=None):
+        # This callback exists for compatibility with older debugging workflows,
+        # but we don't want it printing response bodies
         data = resource.get_data_finish(result)
         content_details = '%d bytes of %s%s for ' % (len(data), content_type, ('; charset='+charset) if charset else '')
-        print('[DATA   ] %sresource %s' % (content_details, resource.get_uri()), file=stderr)
+        print('[DATA   ] %sresource %s (body suppressed)' % (content_details, sanitize_uri(resource.get_uri())), file=stderr)
         if show_headers:
-            for h,v in show_headers.items():
+            for h,v in redact_headers(show_headers).items():
                 print('%s: %s' % (h, v), file=stderr)
             print(file=stderr)
-        if charset or content_type.startswith('text/'):
-            print(data.decode(charset or 'utf-8'), file=stderr)
 
     def on_load_changed(self, webview, event):
         if event != WebKit2.LoadEvent.FINISHED:
@@ -140,7 +223,7 @@ class SAMLLoginView:
         ct = h.get_content_type() if h else None
 
         if self.verbose:
-            print('[PAGE   ] Finished loading page %s' % uri, file=stderr)
+            print('[PAGE   ] Finished loading page %s' % sanitize_uri(uri), file=stderr)
         urip = urlparse(uri)
         origin = '%s %s' % ('🔒' if urip.scheme == 'https' else '🔴', urip.netloc)
         self.window.set_title("SAML Login (%s)" % origin)
@@ -157,10 +240,9 @@ class SAMLLoginView:
 
         if fd:
             if self.verbose:
-                print("[SAML   ] Got SAML result headers: %r" % fd, file=stderr)
+                print("[SAML   ] Got SAML result headers: %r" % redact_saml_fields(fd), file=stderr)
                 if self.verbose > 1:
-                    # display everything we found
-                    mr.get_data(None, self.log_resource_text, ct[0], ct.params.get('charset'), d)
+                    print("[SAML   ] Naw. If you wanna see this, use the original code.", file=stderr)
             self.saml_result.update(fd, server=urlparse(uri).netloc)
             self.check_done()
 
@@ -180,7 +262,7 @@ class SAMLLoginView:
         fd = {}
         for comment in html_parser.comments:
             if self.verbose > 1:
-                print("[SAML   ] Found comment in response body: '%s'" % comment, file=stderr)
+                print("[SAML   ] Found response-body comment (pteREDACTlyed).", file=stderr)
             try:
                 # xml parser requires valid xml with a single root tag, but our expected content
                 # is just a list of data tags, so we need to improvise
@@ -193,10 +275,10 @@ class SAMLLoginView:
                 pass  # silently ignore any comments that don't contain valid xml
 
         if self.verbose > 1:
-            print("[SAML   ] Finished parsing response body for %s" % resource.get_uri(), file=stderr)
+            print("[SAML   ] Finished parsing response body for %s" % sanitize_uri(resource.get_uri()), file=stderr)
         if fd:
             if self.verbose:
-                print("[SAML   ] Got SAML result tags: %s" % fd, file=stderr)
+                print("[SAML   ] Got SAML result tags: %s" % redact_saml_fields(fd), file=stderr)
             self.saml_result.update(fd, server=urlparse(resource.get_uri()).netloc)
 
         if not self.check_done():
@@ -266,10 +348,10 @@ def parse_args(args = None):
     p.add_argument('server', help='GlobalProtect server (portal or gateway)')
     p.add_argument('--no-verify', dest='verify', action='store_false', default=True, help='Ignore invalid server certificate')
     x = p.add_mutually_exclusive_group()
-    x.add_argument('-C', '--cookies', default='~/.gp-saml-gui-cookies',
-                   help='Use and store cookies in this file (instead of default %(default)s)')
+    x.add_argument('-C', '--cookies', default=None,
+                   help='Explicitly persist browser cookies in this file (disabled by default)')
     x.add_argument('-K', '--no-cookies', dest='cookies', action='store_const', const=None,
-                   help="Don't use or store cookies at all")
+                   help="Use an ephemeral browser profile and don't persist cookies (default)")
     x = p.add_mutually_exclusive_group()
     p.add_argument('-i', '--ignore-redirects', action='store_true', help='Use specified gateway hostname as server, ignoring redirects')
     x.add_argument('-g','--gateway', dest='interface', action='store_const', const='gateway', default='portal',
@@ -437,8 +519,10 @@ def main(args = None):
     if args.no_proxy:
         openconnect_args.insert(1, "--no-proxy")
 
-    openconnect_command = '''    echo {} |\n        sudo openconnect {}'''.format(
-        quote(cv), " ".join(map(quote, openconnect_args)))
+    # Never echo the bearer cookie into diagnostics. The actual exec path below
+    # passes it through a temporary stdin file descriptor instead of a shell.
+    openconnect_command = '''    echo '<redacted bearer cookie>' |\n        sudo openconnect {}'''.format(
+        " ".join(map(quote, openconnect_args)))
 
     if args.verbose:
         # Warn about ambiguities
@@ -459,8 +543,9 @@ def main(args = None):
         print(openconnect_command, file=stderr)
 
         print('''\nSAML response converted to test-globalprotect-login.py invocation:\n''', file=stderr)
-        print('''    test-globalprotect-login.py --user={} --clientos={} -p '' \\\n         https://{}/{} {}={}\n'''.format(
-            quote(un), quote(args.clientos), quote(server), quote(if2auth[args.interface]), quote(cn), quote(cv)), file=stderr)
+        print("    test-globalprotect-login.py --user={} --clientos={} -p '' https://{}/{} {}='<redacted bearer cookie>'".format(
+            quote(un), quote(args.clientos), quote(server), quote(if2auth[args.interface]), quote(cn)), file=stderr)
+
 
     if args.exec:
         print('''Launching OpenConnect with {}, equivalent to:\n{}'''.format(args.exec, openconnect_command), file=stderr)
